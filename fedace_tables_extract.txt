@@ -1,0 +1,133 @@
+paragraphs 210 tables 29
+
+=== TABLE 1 ===
+Algorithm 1：Framework of FedACE
+Input：Clients N, client joining ratio , local epochs E, global epochs R, ith client’s private dataset , initial global model , local learning rate , parameter feature alignment learning rate, dynamic weight learning rate .
+Output：Reasonable personalized local models .
+1:  Server sends model  to all clients to initialize local models | 2:  Initialize clients’ participation frequency  for all clients
+3:  for each iteration  do | 4:    if  then
+5:      Server random samples a subset of all clients based on  | 6:      Server sends model to all selected clients
+7:    else if  then
+8:      for each client  do | 9:         Calculate clients’ dataset diversity by Equation (10) | 10:        Calculate clients’ participation frequency  by Equation (11) | 11:        Calculate utility score  | 12:     end for | 13:     Server selects Top-K clients based on  to form the optimal subset | 14:   for each client  in parallel do    | 15:    Client i calculates feature embedding  by Equation (4)     | 16:    Client i executes parameters feature alignment by Equation (3) | 17:    Client i trains dynamic head aggregate weight  by Equation (6)  | 18:    Client i obtains the head parameters updates by Equation (5)  | 19:    for  do | 20:        | 21:    end for | 22:    Execute parameter sparsification to select important parameter updates | 23:    Calculate 、 by Equation (13)、(14) and (15) | 24:    Calculate sparsified parameter updates   | 25:    Client i sends 、 and  to Server  | 26:   end for | 27:    Server aggregate updates and send new global model to next participants | 28:  end for | 29:  return
+
+=== TABLE 13 ===
+Algorithm 2：Contribution-Aware Client Selection
+Input：All clients set , client joining ratio , historically selected clients set , clients’ dataset diversity, clients’ participation frequency .
+Output：Subset of optimal Top-K selected clients .
+1:
+2:  if  then | 3:
+4:  end if | 5:  for each client  do
+6:    Compute utility score  | 7:  end for | 8:  Sort  based on  in descending order | 9:   Select Top-K clients from sorted
+
+=== TABLE 16 ===
+Algorithm 3：Element-Wise Weights Aggregation
+Input：Sparse model parameter update uploaded by client , Sparse diagonal FIM , The trace of the diagonal Fisher information matrix .
+Output：A new round of global model after aggregation .
+1:  for i ← 1 to  do
+2:  # Computer the mask matrix  of client i | 3:
+4:  end for  | 5:  # Computer and sum the weight matrix of
+6:
+7:   | 8:   | 9:  Send the new global model to the participant clients | 10: return
+
+=== TABLE 17 ===
+| （a）CIFAR-10, 1	| （b）CIFAR-10, 3	（c）CIFAR-10, 5
+| （d）CIFAR-100, 1	| （e）CIFAR-100, 3	（f）CIFAR-100, 5
+
+=== TABLE 18 ===
+| Items		Compression ratio in FedACE	Compression ratio in FedACE	Compression ratio in FedACE	Compression ratio in FedACE
+| Items	Dataset	P=20%	P=40%	P=60%	P=80%
+Accurary(%)	CIFAR-10	91.87	91.66	91.52	91.41
+Accurary(%)	CIFAR-100	60.55	59.84	59.33	59.19
+Parameters(MB)	CIFAR-10	0.466	0.932	1.398	1.864
+Parameters(MB)	CIFAR-100	0.466	0.932	1.398	1.864
+
+=== TABLE 19 ===
+	None					FedACE
+CIFAR-10	89.65	89.72	90.89	90.18	90.03	91.87
+CIFAR-100	44.32	55.76	45.45	46.36	45.94	60.55
+
+=== TABLE 20 ===
+Methods			
+FedAvg-P	75.46	73.64	72.15
+FedProx-P	79.61	73.09	71.54
+FedRep	89.50	77.24	72.51
+Ditto	88.72	73.58	65.23
+FedFomo	88.40	76.22	67.91
+FedALA	90.12	81.02	76.52
+FedProto	87.82	76.12	68.58
+FedGH	88.16	76.51	68.61
+FedPAC	89.18	82.47	78.01
+FedACE	91.87	84.28	79.29
+Accuracy	2.69	1.81	1.28
+
+=== TABLE 21 ===
+Methods			
+FedAvg-P	42.94	35.88	34.08
+FedProx-P	41.75	35.76	32.28
+FedRep	47.11	34.16	28.19
+Ditto	50.59	38.09	32.52
+FedFomo	44.49	30.75	28.29
+FedALA	51.87	42.16	37.95
+FedProto	47.31	34.86	29.48
+FedGH	44.11	32.32	26.01
+FedPAC	56.82	46.61	42.69
+FedACE	60.55	51.81	47.61
+Accuracy	3.73	5.2	4.92
+
+=== TABLE 22 ===
+| （a）CIFAR-10	| （b）CIFAR-100
+
+=== TABLE 23 ===
+| （a）Accuracy Cruve on CIFAR-10	| （b）Accuracy Cruve on CIFAR-100
+
+=== TABLE 24 ===
+Number of clients			
+FedAvg-P	42.94	38.19	31.31
+FedProx-P	41.75	37.84	31.85
+FedRep	47.11	43.39	36.59
+Ditto	50.59	41.99	37.71
+FedFomo	44.49	41.45	38.10
+FedALA	51.87	51.29	45.25
+FedProto	47.31	44.56	41.26
+FedGH	44.11	41.07	38.08
+FedPAC	56.82	49.54	42.40
+FedACE	60.55	57.62	49.37
+
+=== TABLE 25 ===
+Methods	Communication  | Params/Iteration
+FedAvg-P	
+FedProx-P	
+FedRep	
+Ditto	
+FedFomo	
+FedALA	
+FedACE	
+
+=== TABLE 26 ===
+Local epochs	5	10	15	20
+FedAvg-P	75.46	75.34	74.59	74.45
+FedProx-P	79.61	78.49	78.02	77.89
+FedRep	89.50	89.16	88.63	88.54
+Ditto	88.72	88.13	87.58	87.43
+FedFomo	88.40	87.89	87.44	87.32
+FedALA	90.12	89.83	89.36	89.27
+FedProto	87.82	87.37	86.91	86.79
+FedGH	88.16	87.60	87.12	86.95
+FedPAC	89.18	89.02	88.84	88.31
+FedACE	91.87	91.72	91.59	91.15
+
+=== TABLE 27 ===
+Local epochs	5	10	15	20
+FedAvg-P	42.94	42.28	41.87	41.68
+FedProx-P	41.75	41.36	41.02	40.87
+FedRep	47.11	46.57	46.01	45.79
+Ditto	50.59	49.87	49.36	49.02
+FedFomo	44.49	44.24	44.03	43.62
+FedALA	51.87	51.42	51.21	51.13
+FedProto	47.31	46.86	46.49	46.15
+FedGH	44.11	43.95	43.78	43.46
+FedPAC	56.82	56.73	56.51	56.30
+FedACE	60.55	60.61	60.43	60.29
+
+=== TABLE 28 ===
+| （a） CIFAR-10	| （b） CIFAR-100

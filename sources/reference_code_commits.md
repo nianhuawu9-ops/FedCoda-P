@@ -1,0 +1,16 @@
+# Reference Code Commits
+
+Captured on 2026-06-27.
+
+| Repo | Commit |
+|---|---|
+| PFLlib | 0169ba7e412c9856a08bb3faefab1e35f538a3c1 |
+| FedALA | a7a9b21342859005f22fc0bffbdb1846975de53b |
+| FedPAC | 5770f4ff8f11ad3be61c2a62b038245fa3f25248 |
+| FedCP | 7110e973a4069db7b05904cde6e76ca6795d7ab8 |
+| GPFL | ed7a7fe1c0fead0f04b7d0408885610d91b363d8 |
+| DBE | 193f4355214004099b4305e0052745960b2660c2 |
+| FedAS | 1a4f5fdb0111a11e92559f6caaa1392e4c181ac1 |
+| FedTGP | c77cbbb31eb30d13066cd11f7f4a2e732aeaae24 |
+| pFedFDA | 73c7c407a49575636bcda222968a2a4ddf73a68a |
+| FLAYER | e33a072769e06ce8678229512c323397cda92b97 |

@@ -1,0 +1,710 @@
+﻿diff --git a/system/flcore/clients/clientcoda.py b/system/flcore/clients/clientcoda.py
+new file mode 100644
+index 0000000..181a3d1
+--- /dev/null
++++ b/system/flcore/clients/clientcoda.py
+@@ -0,0 +1,191 @@
++import time
++
++import numpy as np
++import torch
++import torch.nn.functional as F
++
++from flcore.clients.clientrep import clientRep
++
++
++class clientCoda(clientRep):
++    """FedCoda-P client: FedRep-style local head, shared base training."""
++
++    def __init__(self, args, id, train_samples, test_samples, **kwargs):
++        super().__init__(args, id, train_samples, test_samples, **kwargs)
++        self.use_prototypes = bool(getattr(args, "coda_use_prototypes", True))
++        self.proto_weight = float(getattr(args, "coda_proto_weight", 0.1))
++        self.proto_warmup = int(getattr(args, "coda_proto_warmup", 20))
++        self.proto_ramp = int(getattr(args, "coda_proto_ramp", 20))
++        self.align_weight = float(getattr(args, "coda_align_weight", 0.0))
++        self.anchor_tau = float(getattr(args, "coda_anchor_tau", 0.2))
++        self.local_init_alpha = float(getattr(args, "coda_local_init_alpha", 1.0))
++        self.local_init_min_alpha = float(getattr(args, "coda_local_init_min_alpha", 0.5))
++        self.local_init_warmup = int(getattr(args, "coda_local_init_warmup", 0))
++        self.head_init_alpha = float(getattr(args, "coda_head_init_alpha", 0.0))
++        self.head_init_warmup = int(getattr(args, "coda_head_init_warmup", 0))
++        self.current_round = 0
++        self.global_prototypes = {}
++        self.local_prototypes = {}
++        self.V = 0.0
++        self.h = None
++
++    def set_round(self, round_idx):
++        self.current_round = int(round_idx)
++
++    def set_local_init_alpha(self, alpha):
++        self.local_init_alpha = min(1.0, max(self.local_init_min_alpha, float(alpha)))
++
++    def set_parameters(self, model):
++        source = model.base if hasattr(model, "base") else model
++        alpha = 1.0 if self.current_round < self.local_init_warmup else self.local_init_alpha
++        for new_param, old_param in zip(source.parameters(), self.model.base.parameters()):
++            local = old_param.data.clone()
++            old_param.data = alpha * new_param.data.clone() + (1.0 - alpha) * local
++        if hasattr(model, "head") and self.current_round >= self.head_init_warmup and self.head_init_alpha > 0:
++            for new_param, old_param in zip(model.head.parameters(), self.model.head.parameters()):
++                local = old_param.data.clone()
++                old_param.data = self.head_init_alpha * new_param.data.clone() + (1.0 - self.head_init_alpha) * local
++
++    def set_head(self, head, alpha=None):
++        alpha = self.head_init_alpha if alpha is None else float(alpha)
++        for new_param, old_param in zip(head.parameters(), self.model.head.parameters()):
++            local = old_param.data.clone()
++            old_param.data = alpha * new_param.data.clone() + (1.0 - alpha) * local
++
++    def set_prototypes(self, prototypes):
++        self.global_prototypes = {
++            int(label): prototype.detach().to(self.device)
++            for label, prototype in prototypes.items()
++        }
++
++    def _prototype_head_loss(self):
++        if not self.use_prototypes or self.current_round < self.proto_warmup or not self.global_prototypes:
++            return torch.tensor(0.0, device=self.device)
++        labels = sorted(self.global_prototypes)
++        features = torch.stack([self.global_prototypes[label] for label in labels]).to(self.device)
++        targets = torch.tensor(labels, device=self.device, dtype=torch.long)
++        return self.loss(self.model.head(features), targets)
++
++    def _prototype_weight(self, batch_count):
++        if self.current_round < self.proto_warmup:
++            return 0.0
++        ramp = max(1, self.proto_ramp)
++        progress = min(1.0, (self.current_round - self.proto_warmup + 1) / ramp)
++        # ponytail: same prototype set is reused every batch; normalize so epoch-level weight stays stable.
++        return self.proto_weight * progress / max(1, batch_count)
++
++    def _alignment_loss(self, features, labels):
++        if not self.use_prototypes or self.current_round < self.proto_warmup or self.align_weight <= 0 or not self.global_prototypes:
++            return torch.tensor(0.0, device=self.device)
++        anchor_labels = sorted(self.global_prototypes)
++        label_to_index = {label: index for index, label in enumerate(anchor_labels)}
++        keep = torch.tensor([int(label.item()) in label_to_index for label in labels], device=self.device)
++        if not bool(keep.any()):
++            return torch.tensor(0.0, device=self.device)
++        anchors = torch.stack([self.global_prototypes[label] for label in anchor_labels]).to(self.device)
++        logits = F.normalize(features[keep].float(), dim=1).mm(F.normalize(anchors.float(), dim=1).t())
++        logits = logits / max(self.anchor_tau, 1e-6)
++        targets = torch.tensor([label_to_index[int(label.item())] for label in labels[keep]], device=self.device)
++        return self.loss(logits, targets)
++
++    def collect_prototypes(self):
++        trainloader = self.load_train_data()
++        sums = {}
++        counts = {}
++        sq_sums = {}
++        total_count = 0
++        feature_dim = None
++        self.model.eval()
++        with torch.no_grad():
++            for x, y in trainloader:
++                if type(x) == type([]):
++                    x[0] = x[0].to(self.device)
++                else:
++                    x = x.to(self.device)
++                y = y.to(self.device)
++                features = self.model.base(x)
++                if feature_dim is None:
++                    feature_dim = features.shape[1]
++                total_count += int(y.shape[0])
++                for label in y.unique():
++                    label_int = int(label.item())
++                    class_features = features[y == label]
++                    batch_sum = class_features.sum(dim=0).detach().cpu()
++                    batch_count = int((y == label).sum().item())
++                    sums[label_int] = sums.get(label_int, torch.zeros_like(batch_sum)) + batch_sum
++                    sq_sums[label_int] = sq_sums.get(label_int, 0.0) + float(class_features.detach().float().pow(2).sum().cpu().item())
++                    counts[label_int] = counts.get(label_int, 0) + batch_count
++        self.local_prototypes = {
++            label: (sums[label] / counts[label], counts[label])
++            for label in sums
++            if counts[label] > 0
++        }
++        self.h = torch.zeros((self.num_classes, feature_dim), device=self.device) if feature_dim is not None else None
++        variance = 0.0
++        if self.h is not None and total_count > 0:
++            for label, count in counts.items():
++                mean = (sums[label] / count).to(self.device)
++                py = count / total_count
++                self.h[label] = py * mean
++                variance += py * (sq_sums[label] / count) - (py * py) * float(mean.pow(2).sum().detach().cpu().item())
++        self.V = variance / max(1, self.train_samples)
++
++    def train(self):
++        trainloader = self.load_train_data()
++        batch_count = len(trainloader)
++        start_time = time.time()
++        self.model.train()
++
++        for param in self.model.base.parameters():
++            param.requires_grad = False
++        for param in self.model.head.parameters():
++            param.requires_grad = True
++
++        for _ in range(self.plocal_epochs):
++            for x, y in trainloader:
++                if type(x) == type([]):
++                    x[0] = x[0].to(self.device)
++                else:
++                    x = x.to(self.device)
++                y = y.to(self.device)
++                if self.train_slow:
++                    time.sleep(0.1 * np.abs(np.random.rand()))
++                output = self.model(x)
++                loss = self.loss(output, y) + self._prototype_weight(batch_count) * self._prototype_head_loss()
++                self.optimizer_per.zero_grad()
++                loss.backward()
++                self.optimizer_per.step()
++
++        max_local_epochs = self.local_epochs
++        if self.train_slow:
++            max_local_epochs = np.random.randint(1, max_local_epochs // 2)
++
++        for param in self.model.base.parameters():
++            param.requires_grad = True
++        for param in self.model.head.parameters():
++            param.requires_grad = False
++
++        for _ in range(max_local_epochs):
++            for x, y in trainloader:
++                if type(x) == type([]):
++                    x[0] = x[0].to(self.device)
++                else:
++                    x = x.to(self.device)
++                y = y.to(self.device)
++                if self.train_slow:
++                    time.sleep(0.1 * np.abs(np.random.rand()))
++                features = self.model.base(x)
++                output = self.model.head(features)
++                loss = self.loss(output, y) + self.align_weight * self._alignment_loss(features, y)
++                self.optimizer.zero_grad()
++                loss.backward()
++                self.optimizer.step()
++
++        self.collect_prototypes()
++
++        if self.learning_rate_decay:
++            self.learning_rate_scheduler.step()
++            self.learning_rate_scheduler_per.step()
++
++        self.train_time_cost['num_rounds'] += 1
++        self.train_time_cost['total_cost'] += time.time() - start_time
+diff --git a/system/flcore/servers/servercoda.py b/system/flcore/servers/servercoda.py
+new file mode 100644
+index 0000000..4173e7e
+--- /dev/null
++++ b/system/flcore/servers/servercoda.py
+@@ -0,0 +1,411 @@
++import copy
++import random
++import time
++
++import numpy as np
++import torch
++
++try:
++    from flcore.servers.serverbase import Server
++except ModuleNotFoundError:
++    Server = object
++
++
++def _cosine_conflict(delta, reference):
++    delta = delta.reshape(-1).float()
++    reference = reference.reshape(-1).float()
++    denom = torch.linalg.vector_norm(delta) * torch.linalg.vector_norm(reference)
++    if denom.item() <= 1e-12:
++        return 0.0
++    cosine = torch.dot(delta, reference) / denom.clamp_min(1e-12)
++    return float((1.0 - torch.clamp(cosine, -1.0, 1.0).item()) * 0.5)
++
++
++def _average_prototypes(client_prototypes):
++    totals = {}
++    counts = {}
++    for prototypes in client_prototypes:
++        for label, value in prototypes.items():
++            prototype, count = value
++            label = int(label)
++            if count <= 0:
++                continue
++            if label not in totals:
++                totals[label] = prototype.detach().cpu().float() * count
++                counts[label] = count
++            else:
++                totals[label] += prototype.detach().cpu().float() * count
++                counts[label] += count
++    return {label: totals[label] / counts[label] for label in totals}
++
++
++def _ema_prototypes(previous, current, momentum):
++    updated = dict(previous)
++    for label, prototype in current.items():
++        if label in updated:
++            updated[label] = momentum * updated[label].detach().cpu().float() + (1.0 - momentum) * prototype.detach().cpu().float()
++        else:
++            updated[label] = prototype.detach().cpu().float()
++    return updated
++
++
++def _select_shareable_clients(clients, scores, join_count, random_ratio, rng):
++    join_count = min(join_count, len(clients))
++    random_count = min(join_count, max(0, int(round(join_count * random_ratio))))
++    top_count = join_count - random_count
++    ranked = sorted(clients, key=lambda client: scores.get(client.id, 0.0), reverse=True)
++    selected = ranked[:top_count]
++    remaining = [client for client in clients if client not in selected]
++    if random_count > 0 and remaining:
++        selected.extend(rng.sample(remaining, min(random_count, len(remaining))))
++    return selected
++
++
++def _client_consensus_conflicts(global_model, uploaded_weights, uploaded_models):
++    if not uploaded_models:
++        return []
++    global_params = dict(global_model.base.named_parameters())
++    consensuses = {}
++    for name, global_param in global_params.items():
++        consensuses[name] = sum(
++            weight * (dict(model.base.named_parameters())[name].data - global_param.data)
++            for weight, model in zip(uploaded_weights, uploaded_models)
++        )
++    conflicts = []
++    for model in uploaded_models:
++        model_params = dict(model.base.named_parameters())
++        layer_conflicts = [
++            _cosine_conflict(model_params[name].data - global_param.data, consensuses[name])
++            for name, global_param in global_params.items()
++        ]
++        conflicts.append(float(np.mean(layer_conflicts)) if layer_conflicts else 0.0)
++    return conflicts
++
++
++def _aggregate_head(global_model, uploaded_weights, uploaded_models):
++    if not uploaded_models or not hasattr(global_model, "head"):
++        return
++    with torch.no_grad():
++        for name, global_param in global_model.head.named_parameters():
++            client_params = [dict(model.head.named_parameters())[name].data for model in uploaded_models]
++            global_param.data = sum(weight * param for weight, param in zip(uploaded_weights, client_params)).clone()
++
++
++def _weighted_head_sum(heads, weights):
++    new_head = copy.deepcopy(heads[0])
++    with torch.no_grad():
++        for param in new_head.parameters():
++            param.data.zero_()
++        for weight, head in zip(weights, heads):
++            for new_param, head_param in zip(new_head.parameters(), head.parameters()):
++                new_param.data.add_(head_param.data, alpha=float(weight))
++    return new_head
++
++
++def _solve_pac_weights(num_users, variances, means):
++    try:
++        from flcore.servers.serverpac import solve_quadratic
++        return solve_quadratic(num_users, variances, means)
++    except Exception:
++        # ponytail: cvxpy can be absent or fail numerically; uniform weights keep the round usable.
++        return [[1.0 / num_users] * num_users for _ in range(num_users)]
++
++
++class FedCodaAggregator:
++    def __init__(self, args, model):
++        if not hasattr(model, "base"):
++            raise ValueError("FedCoda-P requires a BaseHeadSplit model with a .base module.")
++        self.spatial_strength = float(getattr(args, "coda_spatial_strength", 0.7))
++        self.temporal_strength = float(getattr(args, "coda_temporal_strength", 0.3))
++        self.min_eligibility = float(getattr(args, "coda_min_eligibility", 0.05))
++        self.temporal_ema = float(getattr(args, "coda_temporal_ema", 0.8))
++        self.spatial_pairs = int(getattr(args, "coda_spatial_pairs", 128))
++        self.rng = random.Random(int(getattr(args, "coda_pair_seed", 0)))
++        self.conflict_gate = float(getattr(args, "coda_conflict_gate", 0.6))
++        self.project_updates = bool(getattr(args, "coda_projection", True))
++        self.adaptive_gate = bool(getattr(args, "coda_adaptive_gate", True))
++        self.layer_freeze = bool(getattr(args, "coda_layer_freeze", False))
++        self.freeze_spatial = float(getattr(args, "coda_freeze_spatial", 0.48))
++        self.freeze_temporal = float(getattr(args, "coda_freeze_temporal", 0.2))
++        self.freeze_patience = int(getattr(args, "coda_freeze_patience", 2))
++        self.freeze_counts = {}
++        self.gate_step = float(getattr(args, "coda_gate_step", 0.05))
++        self.gate_min = float(getattr(args, "coda_gate_min", 0.4))
++        self.gate_max = float(getattr(args, "coda_gate_max", 0.8))
++        self.last_accuracy = None
++        self.gate_keywords = [
++            item.strip()
++            for item in str(getattr(args, "coda_gate_keywords", "fc1")).split(",")
++            if item.strip()
++        ]
++        self.previous_delta = {
++            name: torch.zeros_like(param.data.detach())
++            for name, param in model.base.named_parameters()
++        }
++
++    def _sample_pairs(self, count):
++        pairs = [(i, j) for i in range(count) for j in range(i + 1, count)]
++        if self.spatial_pairs > 0 and len(pairs) > self.spatial_pairs:
++            return self.rng.sample(pairs, self.spatial_pairs)
++        return pairs
++
++    def _should_gate(self, name, spatial):
++        return spatial > self.conflict_gate and any(keyword in name for keyword in self.gate_keywords)
++
++    def _should_freeze(self, name, spatial, temporal):
++        if not self.layer_freeze:
++            return False
++        if spatial > self.freeze_spatial or temporal > self.freeze_temporal:
++            self.freeze_counts[name] = self.freeze_counts.get(name, 0) + 1
++        else:
++            self.freeze_counts[name] = 0
++        return self.freeze_counts[name] >= max(1, self.freeze_patience)
++
++    def _project_conflict_free(self, aggregate, reference):
++        denom = torch.dot(reference.reshape(-1).float(), reference.reshape(-1).float())
++        if denom.item() <= 1e-12:
++            return aggregate, False
++        scale = torch.dot(aggregate.reshape(-1).float(), reference.reshape(-1).float()) / denom
++        if scale.item() >= 0:
++            return aggregate, False
++        return aggregate - scale.to(aggregate.dtype) * reference, True
++
++    def update_accuracy(self, accuracy):
++        if not self.adaptive_gate:
++            return
++        if self.last_accuracy is not None:
++            step = self.gate_step if accuracy >= self.last_accuracy else -self.gate_step
++            self.conflict_gate = min(self.gate_max, max(self.gate_min, self.conflict_gate + step))
++        self.last_accuracy = accuracy
++
++    def aggregate(self, global_model, uploaded_weights, uploaded_models):
++        diagnostics = []
++        spatial_pair_count = 0
++        gated_tensors = 0
++        frozen_tensors = 0
++        projected_tensors = 0
++        with torch.no_grad():
++            for name, global_param in global_model.base.named_parameters():
++                client_params = [
++                    dict(model.base.named_parameters())[name].data
++                    for model in uploaded_models
++                ]
++                aggregate = sum(
++                    weight * (client_param - global_param.data)
++                    for weight, client_param in zip(uploaded_weights, client_params)
++                )
++                deltas = [client_param - global_param.data for client_param in client_params]
++                pairs = self._sample_pairs(len(deltas))
++                spatial_pair_count += len(pairs)
++                pairwise = [
++                    _cosine_conflict(deltas[left], deltas[right])
++                    for left, right in pairs
++                ]
++                spatial = float(np.mean(pairwise)) if pairwise else 0.0
++                consensus = sum(deltas) / len(deltas)
++                if self.project_updates:
++                    aggregate, projected = self._project_conflict_free(aggregate, consensus)
++                    projected_tensors += int(projected)
++                temporal = _cosine_conflict(
++                    aggregate, self.previous_delta.get(name, torch.zeros_like(aggregate))
++                )
++                if self._should_freeze(name, spatial, temporal):
++                    eligibility = 0.0
++                    frozen_tensors += 1
++                elif self._should_gate(name, spatial):
++                    eligibility = 0.0
++                    gated_tensors += 1
++                else:
++                    eligibility = max(
++                        self.min_eligibility,
++                        min(1.0, 1.0 - self.spatial_strength * spatial - self.temporal_strength * temporal),
++                    )
++                # ponytail: tensor-level eligibility; semantic blocks only if reviewers demand coarser structure.
++                global_param.data.add_(eligibility * aggregate)
++                self.previous_delta[name].mul_(self.temporal_ema).add_(
++                    aggregate.detach(),
++                    alpha=1.0 - self.temporal_ema,
++                )
++                diagnostics.append((spatial, temporal, eligibility))
++
++        return {
++            "mean_spatial_conflict": float(np.mean([d[0] for d in diagnostics])) if diagnostics else 0.0,
++            "mean_temporal_conflict": float(np.mean([d[1] for d in diagnostics])) if diagnostics else 0.0,
++            "mean_eligibility": float(np.mean([d[2] for d in diagnostics])) if diagnostics else 1.0,
++            "spatial_pairs": int(spatial_pair_count),
++            "gated_tensors": int(gated_tensors),
++            "frozen_tensors": int(frozen_tensors),
++            "projected_tensors": int(projected_tensors),
++            "conflict_gate": float(self.conflict_gate),
++        }
++
++
++class FedCoda(Server):
++    def __init__(self, args, times):
++        super().__init__(args, times)
++        from flcore.clients.clientcoda import clientCoda
++
++        self.set_slow_clients()
++        self.set_clients(clientCoda)
++        self.client_by_id = {client.id: client for client in self.clients}
++        self.aggregator = FedCodaAggregator(args, self.global_model)
++        self.global_prototypes = {}
++        self.anchor_ema = float(getattr(args, "coda_anchor_ema", 0.9))
++        self.client_select = bool(getattr(args, "coda_client_select", False))
++        self.select_warmup = int(getattr(args, "coda_select_warmup", 20))
++        self.select_random_ratio = float(getattr(args, "coda_select_random_ratio", 0.5))
++        self.select_conflict_weight = float(getattr(args, "coda_select_conflict_weight", 1.0))
++        self.select_coverage_weight = float(getattr(args, "coda_select_coverage_weight", 0.05))
++        self.local_init_alpha = float(getattr(args, "coda_local_init_alpha", 1.0))
++        self.local_init_min_alpha = float(getattr(args, "coda_local_init_min_alpha", 0.5))
++        self.local_init_warmup = int(getattr(args, "coda_local_init_warmup", 0))
++        self.head_collab = bool(getattr(args, "coda_head_collab", False))
++        self.pac_head_collab = bool(getattr(args, "coda_pac_head_collab", False))
++        self.pac_head_alpha = float(getattr(args, "coda_pac_head_alpha", 0.2))
++        self.pac_head_warmup = int(getattr(args, "coda_pac_head_warmup", 30))
++        self.client_scores = {}
++        self.client_conflicts = {}
++        self.current_round = 0
++        self.conflict_history = []
++        self.Budget = []
++
++        print(f"\nJoin ratio / total clients: {self.join_ratio} / {self.num_clients}")
++        print("Finished creating server and clients.")
++
++    def select_clients(self):
++        if self.random_join_ratio:
++            self.current_num_join_clients = np.random.choice(range(self.num_join_clients, self.num_clients + 1), 1, replace=False)[0]
++        else:
++            self.current_num_join_clients = self.num_join_clients
++        if not self.client_select or self.current_round < self.select_warmup:
++            return list(np.random.choice(self.clients, self.current_num_join_clients, replace=False))
++        return _select_shareable_clients(
++            self.clients,
++            self.client_scores,
++            self.current_num_join_clients,
++            self.select_random_ratio,
++            random,
++        )
++
++    def send_models(self):
++        for client in self.clients:
++            client.set_round(self.current_round)
++            conflict = self.client_conflicts.get(client.id, 0.0)
++            alpha = self.local_init_alpha if self.current_round < self.local_init_warmup else self.local_init_alpha - conflict
++            client.set_local_init_alpha(max(self.local_init_min_alpha, alpha))
++            client.set_prototypes(self.global_prototypes)
++        super().send_models()
++
++    def receive_models(self):
++        assert (len(self.selected_clients) > 0)
++
++        active_clients = random.sample(
++            self.selected_clients, int((1-self.client_drop_rate) * self.current_num_join_clients))
++
++        self.uploaded_ids = []
++        self.uploaded_weights = []
++        self.uploaded_models = []
++        self.uploaded_heads = []
++        self.uploaded_prototypes = []
++        self.uploaded_vars = []
++        self.uploaded_hs = []
++        tot_samples = 0
++        for client in active_clients:
++            try:
++                client_time_cost = client.train_time_cost['total_cost'] / client.train_time_cost['num_rounds'] + \
++                        client.send_time_cost['total_cost'] / client.send_time_cost['num_rounds']
++            except ZeroDivisionError:
++                client_time_cost = 0
++            if client_time_cost <= self.time_threthold:
++                tot_samples += client.train_samples
++                self.uploaded_ids.append(client.id)
++                self.uploaded_weights.append(client.train_samples)
++                self.uploaded_models.append(client.model)
++                self.uploaded_heads.append(client.model.head)
++                self.uploaded_prototypes.append(client.local_prototypes)
++                self.uploaded_vars.append(float(getattr(client, "V", 0.0)))
++                self.uploaded_hs.append(getattr(client, "h", None))
++        for i, w in enumerate(self.uploaded_weights):
++            self.uploaded_weights[i] = w / tot_samples
++
++    def aggregate_parameters(self):
++        self.update_client_scores()
++        self.last_diagnostics = self.aggregator.aggregate(
++            self.global_model,
++            self.uploaded_weights,
++            self.uploaded_models,
++        )
++        if self.head_collab:
++            _aggregate_head(self.global_model, self.uploaded_weights, self.uploaded_models)
++        if self.pac_head_collab and self.current_round >= self.pac_head_warmup:
++            self.aggregate_and_send_pac_heads()
++
++    def aggregate_and_send_pac_heads(self):
++        if not self.uploaded_heads or any(h is None for h in self.uploaded_hs):
++            return
++        weights = _solve_pac_weights(len(self.uploaded_heads), self.uploaded_vars, self.uploaded_hs)
++        sent = 0
++        for index, client_id in enumerate(self.uploaded_ids):
++            if weights[index] is None:
++                continue
++            head = _weighted_head_sum(self.uploaded_heads, weights[index])
++            self.client_by_id[client_id].set_head(head, self.pac_head_alpha)
++            sent += 1
++        if hasattr(self, "last_diagnostics"):
++            self.last_diagnostics["pac_heads"] = int(sent)
++
++    def update_client_scores(self):
++        if not self.client_select or not self.uploaded_models:
++            return
++        with torch.no_grad():
++            conflicts = _client_consensus_conflicts(self.global_model, self.uploaded_weights, self.uploaded_models)
++            for client_id, conflict in zip(self.uploaded_ids, conflicts):
++                coverage = len(getattr(self.client_by_id.get(client_id), "local_prototypes", {}))
++                self.client_conflicts[client_id] = conflict
++                self.client_scores[client_id] = self.select_coverage_weight * coverage - self.select_conflict_weight * conflict
++
++    def aggregate_prototypes(self):
++        current = _average_prototypes(self.uploaded_prototypes)
++        self.global_prototypes = _ema_prototypes(self.global_prototypes, current, self.anchor_ema)
++
++    def train(self):
++        for i in range(self.global_rounds + 1):
++            self.current_round = i
++            s_t = time.time()
++            self.selected_clients = self.select_clients()
++            self.send_models()
++
++            if i % self.eval_gap == 0:
++                print(f"\n-------------Round number: {i}-------------")
++                print("\nEvaluate personalized models")
++                self.evaluate()
++                self.aggregator.update_accuracy(self.rs_test_acc[-1])
++
++            for client in self.selected_clients:
++                client.train()
++
++            self.receive_models()
++            if self.dlg_eval and i % self.dlg_gap == 0:
++                self.call_dlg(i)
++            self.aggregate_parameters()
++            self.aggregate_prototypes()
++            self.conflict_history.append({"round": i, **self.last_diagnostics})
++
++            self.Budget.append(time.time() - s_t)
++            print(
++                "-" * 25,
++                "time cost",
++                "-" * 25,
++                self.Budget[-1],
++                "Coda",
++                self.last_diagnostics,
++            )
++
++            if self.auto_break and self.check_done(acc_lss=[self.rs_test_acc], top_cnt=self.top_cnt):
++                break
++
++        print("\nBest accuracy.")
++        print(max(self.rs_test_acc))
++        print("\nAverage time cost per round.")
++        print(sum(self.Budget[1:]) / len(self.Budget[1:]))
++        self.save_results()
+diff --git a/system/main.py b/system/main.py
+index cbc28b5..440fc72 100644
+--- a/system/main.py
++++ b/system/main.py
+@@ -49,6 +49,7 @@ from flcore.servers.serverda import PFL_DA
+ from flcore.servers.serverlc import FedLC
+ from flcore.servers.serveras import FedAS
+ from flcore.servers.servercross import FedCross
++from flcore.servers.servercoda import FedCoda
+ 
+ from flcore.trainmodel.models import *
+ 
+@@ -68,6 +69,16 @@ warnings.simplefilter("ignore")
+ torch.manual_seed(0)
+ 
+ 
++def str2bool(value):
++    if isinstance(value, bool):
++        return value
++    if value.lower() in ("true", "1", "yes", "y"):
++        return True
++    if value.lower() in ("false", "0", "no", "n"):
++        return False
++    raise argparse.ArgumentTypeError("Boolean value expected.")
++
++
+ def run(args):
+ 
+     time_list = []
+@@ -365,6 +376,12 @@ def run(args):
+         elif args.algorithm == "FedCross":
+             server = FedCross(args, i)
+ 
++        elif args.algorithm == "FedCoda-P":
++            args.head = copy.deepcopy(args.model.fc)
++            args.model.fc = nn.Identity()
++            args.model = BaseHeadSplit(args.model, args.head)
++            server = FedCoda(args, i)
++
+         else:
+             raise NotImplementedError
+ 
+@@ -498,6 +515,46 @@ if __name__ == "__main__":
+     parser.add_argument('-ca', "--fedcross_alpha", type=float, default=0.99)
+     parser.add_argument('-cmss', "--collaberative_model_select_strategy", type=int, default=1)
+ 
++    # FedCoda-P
++    parser.add_argument("--coda_spatial_strength", type=float, default=0.7)
++    parser.add_argument("--coda_temporal_strength", type=float, default=0.3)
++    parser.add_argument("--coda_min_eligibility", type=float, default=0.05)
++    parser.add_argument("--coda_temporal_ema", type=float, default=0.8)
++    parser.add_argument("--coda_spatial_pairs", type=int, default=128)
++    parser.add_argument("--coda_pair_seed", type=int, default=0)
++    parser.add_argument("--coda_conflict_gate", type=float, default=0.6)
++    parser.add_argument("--coda_gate_keywords", type=str, default="fc1")
++    parser.add_argument("--coda_projection", type=str2bool, default=True)
++    parser.add_argument("--coda_adaptive_gate", type=str2bool, default=True)
++    parser.add_argument("--coda_layer_freeze", type=str2bool, default=False)
++    parser.add_argument("--coda_freeze_spatial", type=float, default=0.48)
++    parser.add_argument("--coda_freeze_temporal", type=float, default=0.2)
++    parser.add_argument("--coda_freeze_patience", type=int, default=2)
++    parser.add_argument("--coda_gate_step", type=float, default=0.05)
++    parser.add_argument("--coda_gate_min", type=float, default=0.4)
++    parser.add_argument("--coda_gate_max", type=float, default=0.8)
++    parser.add_argument("--coda_use_prototypes", type=str2bool, default=True)
++    parser.add_argument("--coda_proto_weight", type=float, default=0.1)
++    parser.add_argument("--coda_proto_warmup", type=int, default=20)
++    parser.add_argument("--coda_proto_ramp", type=int, default=20)
++    parser.add_argument("--coda_align_weight", type=float, default=0.0)
++    parser.add_argument("--coda_anchor_tau", type=float, default=0.2)
++    parser.add_argument("--coda_anchor_ema", type=float, default=0.9)
++    parser.add_argument("--coda_client_select", type=str2bool, default=False)
++    parser.add_argument("--coda_select_warmup", type=int, default=20)
++    parser.add_argument("--coda_select_random_ratio", type=float, default=0.5)
++    parser.add_argument("--coda_select_conflict_weight", type=float, default=1.0)
++    parser.add_argument("--coda_select_coverage_weight", type=float, default=0.05)
++    parser.add_argument("--coda_local_init_alpha", type=float, default=1.0)
++    parser.add_argument("--coda_local_init_min_alpha", type=float, default=0.5)
++    parser.add_argument("--coda_local_init_warmup", type=int, default=20)
++    parser.add_argument("--coda_head_collab", type=str2bool, default=False)
++    parser.add_argument("--coda_head_init_alpha", type=float, default=0.0)
++    parser.add_argument("--coda_head_init_warmup", type=int, default=20)
++    parser.add_argument("--coda_pac_head_collab", type=str2bool, default=False)
++    parser.add_argument("--coda_pac_head_alpha", type=float, default=0.2)
++    parser.add_argument("--coda_pac_head_warmup", type=int, default=30)
++
+ 
+     args = parser.parse_args()
+ 
+@@ -524,4 +581,4 @@ if __name__ == "__main__":
+ 
+     
+     # print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=20))
+-    # print(f"\nTotal time cost: {round(time.time()-total_start, 2)}s.")
+\ No newline at end of file
++    # print(f"\nTotal time cost: {round(time.time()-total_start, 2)}s.")

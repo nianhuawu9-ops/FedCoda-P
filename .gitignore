@@ -1,0 +1,10 @@
+third_party/*
+!third_party/PFLlib.commit
+results/
+sources/*.json
+*.h5
+*.pt
+__pycache__/
+*.pyc
+.venv/
+.idea/
