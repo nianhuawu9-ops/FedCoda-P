@@ -197,10 +197,10 @@ index 0000000..181a3d1
 +        self.train_time_cost['total_cost'] += time.time() - start_time
 diff --git a/system/flcore/servers/servercoda.py b/system/flcore/servers/servercoda.py
 new file mode 100644
-index 0000000..4173e7e
+index 0000000..a43c6a7
 --- /dev/null
 +++ b/system/flcore/servers/servercoda.py
-@@ -0,0 +1,411 @@
+@@ -0,0 +1,440 @@
 +import copy
 +import random
 +import time
@@ -215,6 +215,15 @@ index 0000000..4173e7e
 +
 +
 +def _cosine_conflict(delta, reference):
++    if delta.dim() == 4 and reference.dim() == 4:
++        delta = delta.reshape(delta.shape[0], -1).float()
++        reference = reference.reshape(reference.shape[0], -1).float()
++        denom = torch.linalg.vector_norm(delta, dim=1) * torch.linalg.vector_norm(reference, dim=1)
++        valid = denom > 1e-12
++        if not bool(valid.any()):
++            return 0.0
++        cosine = torch.sum(delta[valid] * reference[valid], dim=1) / denom[valid].clamp_min(1e-12)
++        return float(((1.0 - torch.clamp(cosine, -1.0, 1.0)) * 0.5).mean().item())
 +    delta = delta.reshape(-1).float()
 +    reference = reference.reshape(-1).float()
 +    denom = torch.linalg.vector_norm(delta) * torch.linalg.vector_norm(reference)
@@ -222,6 +231,13 @@ index 0000000..4173e7e
 +        return 0.0
 +    cosine = torch.dot(delta, reference) / denom.clamp_min(1e-12)
 +    return float((1.0 - torch.clamp(cosine, -1.0, 1.0).item()) * 0.5)
++
++
++def _unit_direction(tensor):
++    norm = torch.linalg.vector_norm(tensor.float())
++    if norm.item() <= 1e-12:
++        return torch.zeros_like(tensor)
++    return tensor / norm.to(tensor.dtype)
 +
 +
 +def _average_prototypes(client_prototypes):
@@ -341,10 +357,16 @@ index 0000000..4173e7e
 +            for item in str(getattr(args, "coda_gate_keywords", "fc1")).split(",")
 +            if item.strip()
 +        ]
++        self.norm_keywords = ("bn", "norm", "ln", "gn", "downsample.1")
 +        self.previous_delta = {
 +            name: torch.zeros_like(param.data.detach())
 +            for name, param in model.base.named_parameters()
++            if self._is_shared_parameter(name)
 +        }
++
++    def _is_shared_parameter(self, name):
++        lowered = name.lower()
++        return not any(keyword in lowered for keyword in self.norm_keywords)
 +
 +    def _sample_pairs(self, count):
 +        pairs = [(i, j) for i in range(count) for j in range(i + 1, count)]
@@ -387,8 +409,12 @@ index 0000000..4173e7e
 +        gated_tensors = 0
 +        frozen_tensors = 0
 +        projected_tensors = 0
++        skipped_norm_tensors = 0
 +        with torch.no_grad():
 +            for name, global_param in global_model.base.named_parameters():
++                if not self._is_shared_parameter(name):
++                    skipped_norm_tensors += 1
++                    continue
 +                client_params = [
 +                    dict(model.base.named_parameters())[name].data
 +                    for model in uploaded_models
@@ -405,7 +431,7 @@ index 0000000..4173e7e
 +                    for left, right in pairs
 +                ]
 +                spatial = float(np.mean(pairwise)) if pairwise else 0.0
-+                consensus = sum(deltas) / len(deltas)
++                consensus = aggregate
 +                if self.project_updates:
 +                    aggregate, projected = self._project_conflict_free(aggregate, consensus)
 +                    projected_tensors += int(projected)
@@ -425,10 +451,12 @@ index 0000000..4173e7e
 +                    )
 +                # ponytail: tensor-level eligibility; semantic blocks only if reviewers demand coarser structure.
 +                global_param.data.add_(eligibility * aggregate)
++                direction = _unit_direction(aggregate.detach())
 +                self.previous_delta[name].mul_(self.temporal_ema).add_(
-+                    aggregate.detach(),
++                    direction,
 +                    alpha=1.0 - self.temporal_ema,
 +                )
++                self.previous_delta[name].copy_(_unit_direction(self.previous_delta[name]))
 +                diagnostics.append((spatial, temporal, eligibility))
 +
 +        return {
@@ -439,6 +467,7 @@ index 0000000..4173e7e
 +            "gated_tensors": int(gated_tensors),
 +            "frozen_tensors": int(frozen_tensors),
 +            "projected_tensors": int(projected_tensors),
++            "skipped_norm_tensors": int(skipped_norm_tensors),
 +            "conflict_gate": float(self.conflict_gate),
 +        }
 +

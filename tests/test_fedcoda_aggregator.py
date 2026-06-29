@@ -14,7 +14,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SYSTEM = ROOT / "third_party" / "PFLlib" / "system"
 sys.path.insert(0, str(SYSTEM))
 
-from flcore.servers.servercoda import FedCodaAggregator, _aggregate_head, _client_consensus_conflicts, _select_shareable_clients, _weighted_head_sum  # noqa: E402
+from flcore.servers.servercoda import FedCodaAggregator, _aggregate_head, _client_consensus_conflicts, _cosine_conflict, _select_shareable_clients, _weighted_head_sum  # noqa: E402
 
 
 class TinySplit(nn.Module):
@@ -48,6 +48,16 @@ class TinyNamedSplit(nn.Module):
         self.head = nn.Linear(2, 2, bias=False)
 
 
+class TinyNormSplit(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.base = nn.Sequential(OrderedDict([
+            ("low", nn.Linear(2, 2, bias=False)),
+            ("bn", nn.BatchNorm1d(2, affine=True)),
+        ]))
+        self.head = nn.Linear(2, 2, bias=False)
+
+
 def _model_with_base(value):
     model = TinySplit()
     with torch.no_grad():
@@ -64,7 +74,26 @@ def _named_model(low_value, fc1_value):
     return model
 
 
+def _norm_model(low_value, bn_weight):
+    model = TinyNormSplit()
+    with torch.no_grad():
+        model.base.low.weight.copy_(torch.eye(2) * low_value)
+        model.base.bn.weight.fill_(bn_weight)
+        model.base.bn.bias.zero_()
+    return model
+
+
 class FedCodaAggregatorTest(unittest.TestCase):
+    def test_conv_conflict_is_computed_per_output_channel(self):
+        delta = torch.zeros(2, 1, 1, 1)
+        reference = torch.zeros(2, 1, 1, 1)
+        delta[0, 0, 0, 0] = 1.0
+        reference[0, 0, 0, 0] = -1.0
+        delta[1, 0, 0, 0] = 1000.0
+        reference[1, 0, 0, 0] = 1000.0
+
+        self.assertAlmostEqual(_cosine_conflict(delta, reference), 0.5)
+
     def test_keeps_head_local_and_damps_conflicting_backbone_updates(self):
         args = types.SimpleNamespace(
             coda_spatial_strength=1.0,
@@ -127,10 +156,42 @@ class FedCodaAggregatorTest(unittest.TestCase):
         aggregator = FedCodaAggregator(args, copy.deepcopy(global_model))
         aggregator.aggregate(global_model, [1.0], [client])
 
+        expected = torch.eye(2) / torch.linalg.vector_norm(torch.eye(2))
         self.assertTrue(torch.allclose(
             aggregator.previous_delta["0.weight"],
-            torch.eye(2) * 0.5,
+            expected,
         ))
+
+    def test_temporal_state_stores_unit_direction_not_raw_scale(self):
+        args = types.SimpleNamespace(
+            coda_spatial_strength=0.0,
+            coda_temporal_strength=0.0,
+            coda_min_eligibility=0.0,
+        )
+        global_model = _model_with_base(1.0)
+        client = _model_with_base(11.0)
+
+        aggregator = FedCodaAggregator(args, copy.deepcopy(global_model))
+        aggregator.aggregate(global_model, [1.0], [client])
+
+        self.assertAlmostEqual(float(torch.linalg.vector_norm(aggregator.previous_delta["0.weight"])), 1.0)
+
+    def test_norm_affine_parameters_stay_local_only(self):
+        args = types.SimpleNamespace(
+            coda_spatial_strength=0.0,
+            coda_temporal_strength=0.0,
+            coda_min_eligibility=0.0,
+        )
+        global_model = _norm_model(1.0, 1.0)
+        client = _norm_model(2.0, 5.0)
+
+        aggregator = FedCodaAggregator(args, copy.deepcopy(global_model))
+        diagnostics = aggregator.aggregate(global_model, [1.0], [client])
+
+        self.assertTrue(torch.allclose(global_model.base.low.weight, torch.eye(2) * 2.0))
+        self.assertTrue(torch.allclose(global_model.base.bn.weight, torch.ones_like(global_model.base.bn.weight)))
+        self.assertNotIn("bn.weight", aggregator.previous_delta)
+        self.assertEqual(diagnostics["skipped_norm_tensors"], 2)
 
     def test_spatial_pair_sampling_is_bounded_and_reported(self):
         args = types.SimpleNamespace(
@@ -182,6 +243,23 @@ class FedCodaAggregatorTest(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertTrue(torch.allclose(projected, torch.tensor([0.0, 2.0])))
+
+    def test_projection_uses_weighted_consensus_direction_in_aggregate(self):
+        args = types.SimpleNamespace(
+            coda_spatial_strength=0.0,
+            coda_temporal_strength=0.0,
+            coda_min_eligibility=0.0,
+            coda_projection=True,
+        )
+        global_model = _model_with_base(1.0)
+        aligned = _model_with_base(2.0)
+        outlier = _model_with_base(-9.0)
+
+        aggregator = FedCodaAggregator(args, copy.deepcopy(global_model))
+        diagnostics = aggregator.aggregate(global_model, [0.99, 0.01], [aligned, outlier])
+
+        self.assertGreater(float(global_model.base[0].weight[0, 0].detach()), 1.5)
+        self.assertEqual(diagnostics["projected_tensors"], 0)
 
     def test_adaptive_gate_tightens_after_accuracy_drop_and_relaxes_after_gain(self):
         args = types.SimpleNamespace(
